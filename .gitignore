@@ -7,3 +7,13 @@ node_modules/
 profile/
 edge-profile/
 *.log
+downloads/
+screenshots/
+auth.json
+cookies*.json
+storage-state*.json
+*.har
+*.pem
+*.key
+*.pfx
+*.p12

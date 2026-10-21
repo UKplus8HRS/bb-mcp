@@ -9,28 +9,64 @@ const { createHash, randomUUID } = require('node:crypto');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const fs = require('node:fs/promises');
+const { readFileSync } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 
 const execFileAsync = promisify(execFile);
-const START_URL = 'https://www.ole.bris.ac.uk/ultra/course';
-const PROFILE = path.join(os.homedir(), '.codex', 'blackboard-browser', 'edge-profile');
+const periodSchema = z.object({
+  start: z.string(), end: z.string(), firstWeek: z.number().int().min(0).optional(),
+  label: z.string().optional(), phase: z.string().default('Teaching week'),
+  weekNames: z.record(z.string()).default({}),
+}).strict();
+const configSchema = z.object({
+  startUrl: z.string().url(),
+  allowedHosts: z.array(z.string().regex(/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i)).default([]),
+  timeZone: z.string().default(Intl.DateTimeFormat().resolvedOptions().timeZone),
+  profileDir: z.string().min(1).optional(),
+  loginButtonName: z.string().min(1).optional(),
+  signedInSelector: z.string().min(1).optional(),
+  calendar: z.array(periodSchema).default([]),
+  calendarSources: z.array(z.string().url()).default([]),
+}).strict();
+
+function validateConfig(input) {
+  const config = configSchema.parse(input);
+  const url = new URL(config.startUrl);
+  if (url.protocol !== 'https:' || url.username || url.password) throw new Error('startUrl must use HTTPS without embedded credentials.');
+  new Intl.DateTimeFormat('en', { timeZone: config.timeZone });
+  const periods = [...config.calendar].sort((a, b) => a.start.localeCompare(b.start));
+  for (let i = 0; i < periods.length; i++) {
+    if (dateValue(periods[i].start) >= dateValue(periods[i].end)) throw new Error('Calendar periods must end after they start.');
+    if (i && periods[i].start < periods[i - 1].end) throw new Error('Calendar periods must not overlap.');
+  }
+  return config;
+}
+
+const configPath = process.argv.includes('--self-test') ? path.join(__dirname, '..', 'config.example.json') : process.env.BB_CONFIG || path.join(__dirname, '..', 'config.local.json');
+let configInput;
+try { configInput = JSON.parse(readFileSync(configPath, 'utf8')); }
+catch (error) {
+  if (error.code === 'ENOENT') throw new Error('Copy config.example.json to config.local.json and set your Blackboard URL, or set BB_CONFIG to your configuration file.');
+  throw new Error('Could not read Blackboard configuration. Check that it is valid JSON.');
+}
+const CONFIG = validateConfig(configInput);
+const START_URL = CONFIG.startUrl;
+const PROFILE = CONFIG.profileDir ? path.resolve(path.dirname(configPath), CONFIG.profileDir) : path.join(os.homedir(), '.blackboard-mcp', new URL(START_URL).hostname, 'edge-profile');
 const PIPE = `\\\\.\\pipe\\codex-blackboard-playwright-${createHash('sha256').update(PROFILE.toLowerCase()).digest('hex').slice(0, 16)}`;
 const DOWNLOAD_DIR = path.join(os.tmpdir(), 'codex-blackboard-downloads');
-const ALLOWED_HOSTS = ['ole.bris.ac.uk', 'bristol.ac.uk', 'bris.ac.uk'];
-const CALENDAR_SOURCE = 'https://www.bristol.ac.uk/students/your-studies/academic-year-dates/';
-const CALENDAR_POLICY = 'https://www.bristol.ac.uk/media-library/sites/academic-quality/documents/policy/university-academic-calendar-policy.pdf';
-const WEEK_NAMES = { 6: '巩固周', 12: '考核准备周', 18: '巩固周', 24: '考核准备周' };
+const ALLOWED_HOSTS = [new URL(START_URL).hostname, ...CONFIG.allowedHosts.map(host => host.toLowerCase())];
+const SIGNED_IN_SELECTOR = CONFIG.signedInSelector || 'a[href*="/ultra/course"], a[href*="/ultra/stream"], a[href*="action=logout"], a[href*="/logout"]';
 let context;
 let page;
 let releaseLock;
 let launching;
 
-function allowedUrl(value) {
+function allowedUrl(value, hosts = ALLOWED_HOSTS) {
   try {
     const url = new URL(value);
-    return url.protocol === 'https:' && ALLOWED_HOSTS.some(host => url.hostname === host || url.hostname.endsWith(`.${host}`));
+    return url.protocol === 'https:' && !url.username && !url.password && hosts.some(host => url.hostname === host || url.hostname.endsWith(`.${host}`));
   } catch { return false; }
 }
 
@@ -39,44 +75,37 @@ function reply(value, isError = false) {
 }
 
 function dateValue(date) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('日期须为 YYYY-MM-DD。');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('Dates must use YYYY-MM-DD.');
   const value = Date.parse(`${date}T00:00:00Z`);
-  if (!Number.isFinite(value) || new Date(value).toISOString().slice(0, 10) !== date) throw new Error('日期无效。');
+  if (!Number.isFinite(value) || new Date(value).toISOString().slice(0, 10) !== date) throw new Error('Invalid date.');
   return value;
 }
 
-function localDate(now = new Date()) {
+function localDate(now = new Date(), timeZone = CONFIG.timeZone) {
   const parts = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit',
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
   }).formatToParts(now).map(({ type, value }) => [type, value]));
   return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
-function academicWeek(date) {
+function academicWeek(date, periods = CONFIG.calendar) {
   const day = dateValue(date);
-  const inRange = (start, end) => day >= dateValue(start) && day < dateValue(end);
-  const numbered = (start, firstWeek) => {
-    const week = firstWeek + Math.floor((day - dateValue(start)) / 604800000);
-    return { week, label: `Week ${week}`, phase: WEEK_NAMES[week] || '教学周' };
-  };
-  let result;
-  if (inRange('2026-09-14', '2026-09-21')) result = { week: 0, label: 'Week 0', phase: '迎新周' };
-  else if (inRange('2026-09-21', '2026-12-14')) result = numbered('2026-09-21', 1);
-  else if (inRange('2026-12-14', '2026-12-21')) result = { label: 'MA1', phase: 'TB1 考核周' };
-  else if (inRange('2026-12-21', '2027-01-11')) result = { phase: '寒假' };
-  else if (inRange('2027-01-11', '2027-01-18')) result = { label: 'P1', phase: 'TB2 准备周' };
-  else if (inRange('2027-01-18', '2027-03-22')) result = numbered('2027-01-18', 13);
-  else if (inRange('2027-03-22', '2027-04-12')) result = { phase: '春假' };
-  else if (inRange('2027-04-12', '2027-05-03')) result = numbered('2027-04-12', 22);
-  else if (inRange('2027-05-03', '2027-05-24')) result = { phase: 'TB2 考核期' };
-  else result = { phase: '无已核对的学年周次' };
-  return { date, ...result, sources: [CALENDAR_SOURCE, CALENDAR_POLICY], note: '学校标准学年周次；具体课程的 Week 编号和上课安排须以该课 Blackboard 页面及课表核对。' };
+  const period = periods.find(item => day >= dateValue(item.start) && day < dateValue(item.end));
+  let result = { phase: 'No configured academic calendar mapping' };
+  if (period) {
+    result = { phase: period.phase, ...(period.label ? { label: period.label } : {}) };
+    if (period.firstWeek !== undefined) {
+      const week = period.firstWeek + Math.floor((day - dateValue(period.start)) / 604800000);
+      result = { week, label: `Week ${week}`, phase: period.weekNames[week] || period.phase };
+    }
+  }
+  return { date, ...result, sources: CONFIG.calendarSources, note: 'Calendar entries are user-configured. Confirm course-specific week numbers and schedules in Blackboard.' };
 }
 
 function dateContext(now = new Date()) {
   const today = localDate(now);
   const tomorrow = new Date(dateValue(today) + 86400000).toISOString().slice(0, 10);
-  return { today: academicWeek(today), tomorrow: academicWeek(tomorrow), timeZone: 'Europe/London' };
+  return { today: academicWeek(today), tomorrow: academicWeek(tomorrow), timeZone: CONFIG.timeZone };
 }
 
 async function acquireLock() {
@@ -87,7 +116,7 @@ async function acquireLock() {
       lock.listen(PIPE, () => { lock.off('error', reject); resolve(); });
     });
   } catch (error) {
-    if (error.code === 'EADDRINUSE') throw new Error('BUSY: 另一 Blackboard Playwright 会话正在使用同一个 Edge 登录资料。请在该会话继续操作，或关闭其浏览器后重试。');
+    if (error.code === 'EADDRINUSE') throw new Error('BUSY: Another Blackboard session owns this Edge profile. Continue there or close its browser before retrying.');
     throw error;
   }
   let closing;
@@ -109,7 +138,7 @@ async function ensureBrowser() {
   launching = (async () => {
     const unlock = await acquireLock();
     try {
-      if (await edgeUsingProfile()) throw new Error('BUSY: 现有 Edge 正占用 Blackboard 登录资料。请关闭旧 Blackboard Edge 窗口后重试；不会打开空白窗口。');
+      if (await edgeUsingProfile()) throw new Error('BUSY: Edge is already using this Blackboard profile. Close that window before retrying.');
       const ctx = await chromium.launchPersistentContext(PROFILE, {
         channel: 'msedge', headless: false, viewport: { width: 1440, height: 1000 },
         acceptDownloads: true,
@@ -157,26 +186,34 @@ async function snapshot(p, maxChars = 12000) {
 
 function target(p, args) {
   if (args.ref) {
-    if (!/^e\d+$/.test(args.ref)) throw new Error('ref 必须是最新页面快照中的 e1、e2 等编号。');
+    if (!/^e\d+$/.test(args.ref)) throw new Error('Use an element reference such as e1 from the latest snapshot.');
     return p.locator(`[data-bb-ref="${args.ref}"]`);
   }
   if (args.role && args.name) return p.getByRole(args.role, { name: args.name, exact: true });
   if (args.selector) return p.locator(args.selector);
-  throw new Error('请提供 ref、role + name，或 selector。');
+  throw new Error('Provide ref, role + name, or selector.');
 }
 
 async function loginState(p) {
   const url = p.url();
   const title = await p.title().catch(() => '');
   const text = await p.locator('body').innerText({ timeout: 3000 }).catch(() => '');
-  if (url.startsWith('https://www.ole.bris.ac.uk/ultra/') && /\bCourses\b/i.test(text) && /\bLog Out\b/i.test(text)) return { status: 'signed_in', url, title };
-  if (/microsoftonline\.com|microsoft\.com|live\.com/i.test(new URL(url).hostname)) return { status: 'needs_user', url, message: '请在已经打开的 Edge 窗口完成学校账号登录或 MFA，然后再次调用 blackboard_login。' };
+  // shortcut: custom themes may need signedInSelector in the local configuration.
+  if (allowedUrl(url)) {
+    const signedIn = await p.locator(SIGNED_IN_SELECTOR).evaluateAll(elements => elements.some(el => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+    }));
+    if (signedIn || (/\bCourses\b/i.test(text) && /\bLog Out\b/i.test(text))) return { status: 'signed_in', url, title };
+  }
+  const requiresInput = await p.locator('input[type="password"]:visible, input[autocomplete="one-time-code"]:visible').count();
+  if ((url !== 'about:blank' && !allowedUrl(url)) || requiresInput) return { status: 'needs_user', url, title, message: 'Complete your institution sign-in or MFA in the open Edge window, then call blackboard_login again.' };
   return { status: 'pending', url, title };
 }
 
 async function login() {
   let p = await ensureBrowser();
-  if (p.url() === 'about:blank' || (!allowedUrl(p.url()) && !/microsoftonline\.com|microsoft\.com|live\.com/i.test(p.url()))) {
+  if (p.url() === 'about:blank') {
     await p.goto(START_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
   }
   const deadline = Date.now() + 20000;
@@ -185,7 +222,8 @@ async function login() {
   let signedSince = 0;
   do {
     p = page || p;
-    const button = p.getByRole('link', { name: /staff and student login/i }).or(p.getByRole('button', { name: /staff and student login/i })).first();
+    const name = CONFIG.loginButtonName || /^(?:staff and student login|institution(?:al)? login|single sign[- ]on|sso(?: login)?)$/i;
+    const button = p.getByRole('link', { name, exact: true }).or(p.getByRole('button', { name, exact: true })).first();
     if (!clicked && await button.isVisible().catch(() => false)) {
       await button.click();
       clicked = true;
@@ -198,7 +236,7 @@ async function login() {
     } else signedSince = 0;
     await p.waitForTimeout(500);
   } while (Date.now() < deadline);
-  return state.status === 'needs_user' ? state : { ...state, message: '登录跳转尚未完成；浏览器保持打开。稍后再次调用 blackboard_login 查看结果。' };
+  return state.status === 'needs_user' ? state : { ...state, message: 'Sign-in is not confirmed yet. The browser remains open; inspect the page or call blackboard_login again.' };
 }
 
 async function close() {
@@ -209,7 +247,7 @@ async function close() {
   releaseLock = undefined;
 }
 
-const server = new McpServer({ name: 'blackboard-playwright', version: '1.0.0' });
+const server = new McpServer({ name: 'blackboard-playwright', version: '1.1.0' });
 function tool(name, description, inputSchema, run) {
   server.registerTool(name, { description, inputSchema }, async args => {
     try { return reply(await run(args)); }
@@ -218,77 +256,129 @@ function tool(name, description, inputSchema, run) {
 }
 const selectorSchema = { ref: z.string().optional(), role: z.string().optional(), name: z.string().optional(), selector: z.string().optional() };
 
-tool('blackboard_login', '打开 University of Bristol Blackboard；先点击 Staff and student login，只有需要密码或 MFA 时才请用户接手。返回英国本地日期及学校周次。', {}, async () => ({ ...await login(), calendar: dateContext() }));
-tool('blackboard_academic_week', '按英国本地日期查询 Bristol 标准学年周次；课程 Week 编号和具体上课内容仍须查看该课页面及课表。缺省查询今天和明天。', { date: z.string().optional() }, async ({ date }) => date ? academicWeek(date) : dateContext());
-tool('blackboard_snapshot', '读取当前 Blackboard 页面文本、英国本地日期、学校周次和可交互元素；页面变化后重新获取 ref。', { max_chars: z.number().int().min(200).max(50000).optional() }, async ({ max_chars }) => snapshot(await ensureBrowser(), max_chars));
-tool('blackboard_open', '在当前 Playwright 标签页打开 Bristol 官方网页，包括 Blackboard 和 app.bristol.ac.uk 的个人课表。', { url: z.string().url() }, async ({ url }) => {
-  if (!allowedUrl(url)) throw new Error('只允许直接打开 University of Bristol 的 HTTPS 页面。');
+tool('blackboard_login', 'Open the configured Blackboard site and institution login link. Complete passwords and MFA manually. Returns local dates and any configured academic calendar.', {}, async () => ({ ...await login(), calendar: dateContext() }));
+tool('blackboard_academic_week', 'Look up a date in the configured academic calendar, or return today and tomorrow. No week number is inferred without a matching calendar entry.', { date: z.string().optional() }, async ({ date }) => date ? academicWeek(date) : dateContext());
+tool('blackboard_snapshot', 'Read the current page text, local calendar and interactive elements. Refresh element references after page changes.', { max_chars: z.number().int().min(200).max(50000).optional() }, async ({ max_chars }) => snapshot(await ensureBrowser(), max_chars));
+tool('blackboard_open', 'Open an HTTPS page on the configured Blackboard host or an additional allowed host.', { url: z.string().url() }, async ({ url }) => {
+  if (!allowedUrl(url)) throw new Error('Only HTTPS URLs without embedded credentials on configured hosts may be opened directly.');
   const p = await ensureBrowser();
   await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   return snapshot(p);
 });
-tool('blackboard_click', '点击当前页面的可见元素，然后返回页面快照。', selectorSchema, async args => {
+tool('blackboard_click', 'Click a visible element and return a fresh page snapshot.', selectorSchema, async args => {
   const p = await ensureBrowser();
   await target(p, args).click();
   await p.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
   return snapshot(page || p);
 });
-tool('blackboard_type', '在当前页面的输入框填入文本；可选按 Enter。', { ...selectorSchema, value: z.string(), submit: z.boolean().optional() }, async args => {
+tool('blackboard_type', 'Fill a field and optionally press Enter. Users should enter passwords and MFA themselves in the browser.', { ...selectorSchema, value: z.string(), submit: z.boolean().optional() }, async args => {
   const p = await ensureBrowser();
   const locator = target(p, args);
   await locator.fill(args.value);
   if (args.submit) await locator.press('Enter');
   return snapshot(page || p);
 });
-tool('blackboard_press', '向当前页面发送按键。', { key: z.string() }, async ({ key }) => {
+tool('blackboard_press', 'Send a keyboard key to the current page.', { key: z.string() }, async ({ key }) => {
   const p = await ensureBrowser();
   await p.keyboard.press(key);
   return snapshot(page || p);
 });
-tool('blackboard_download', '点击页面上的下载按钮，并将 Playwright 捕获的文件保存到系统临时目录。', { ...selectorSchema, expected_filename: z.string().optional() }, async args => {
+tool('blackboard_download', 'Click a download control and save the captured file to the system temporary directory.', { ...selectorSchema, expected_filename: z.string().optional() }, async args => {
   const p = await ensureBrowser();
   const [download] = await Promise.all([p.waitForEvent('download', { timeout: 30000 }), target(p, args).click()]);
   const filename = download.suggestedFilename();
-  if (args.expected_filename && filename !== args.expected_filename) throw new Error(`下载文件名不符：预期 ${args.expected_filename}，实际 ${filename}。文件未保存。`);
+  if (args.expected_filename && filename !== args.expected_filename) throw new Error(`Expected filename ${args.expected_filename}; received ${filename}. The file was not saved.`);
   await fs.mkdir(DOWNLOAD_DIR, { recursive: true });
   const destination = path.join(DOWNLOAD_DIR, `${randomUUID()}-${path.basename(filename).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')}`);
   await download.saveAs(destination);
   return { filename, path: destination };
 });
-tool('blackboard_tabs', '列出 Playwright 标签页；提供 index 时切换到该标签页。', { index: z.number().int().min(1).optional() }, async ({ index }) => {
+tool('blackboard_tabs', 'List browser tabs, or switch to the supplied one-based tab index.', { index: z.number().int().min(1).optional() }, async ({ index }) => {
   await ensureBrowser();
   const tabs = context.pages().filter(p => !p.isClosed());
   if (index) {
-    if (!tabs[index - 1]) throw new Error(`没有第 ${index} 个标签页。`);
+    if (!tabs[index - 1]) throw new Error(`Tab ${index} does not exist.`);
     page = tabs[index - 1];
     await page.bringToFront();
   }
   return Promise.all(tabs.map(async (p, i) => ({ index: i + 1, active: p === page, title: await p.title().catch(() => ''), url: p.url() })));
 });
-tool('blackboard_screenshot', '在确需查看视觉内容时截取当前页面。', {}, async () => {
+tool('blackboard_screenshot', 'Save a screenshot of the current page when visual inspection is needed.', {}, async () => {
   const p = await ensureBrowser();
   await fs.mkdir(DOWNLOAD_DIR, { recursive: true });
   const destination = path.join(DOWNLOAD_DIR, `${randomUUID()}.png`);
   await p.screenshot({ path: destination });
   return { path: destination };
 });
-tool('blackboard_close', '关闭本会话控制的 Edge 窗口并释放登录资料。', {}, async () => { await close(); return '已关闭 Blackboard Edge；登录资料已保留。'; });
+tool('blackboard_close', 'Close this browser session and release its profile lock.', {}, async () => { await close(); return 'Blackboard Edge closed. The local sign-in profile was retained.'; });
+
+async function selfTest() {
+  assert(allowedUrl(START_URL));
+  for (const host of ['learn.example.edu', 'campus.example.org']) {
+    const config = validateConfig({ startUrl: `https://${host}/`, allowedHosts: ['portal.example.edu'] });
+    const hosts = [new URL(config.startUrl).hostname, ...config.allowedHosts];
+    assert(allowedUrl(`https://${host}/ultra/course`, hosts));
+    assert(allowedUrl(`https://content.${host}/`, hosts));
+    assert(allowedUrl('https://portal.example.edu/timetable', hosts));
+    assert(!allowedUrl(`http://${host}/`, hosts));
+    assert(!allowedUrl(`https://${host}.evil.example/`, hosts));
+    assert(!allowedUrl(`https://user:password@${host}/`, hosts));
+    assert(!allowedUrl('https://unrelated.example/', hosts));
+  }
+  assert.throws(() => validateConfig({ startUrl: 'http://learn.example.edu' }));
+  assert.throws(() => validateConfig({ startUrl: 'https://user:password@learn.example.edu' }));
+  assert.throws(() => validateConfig({ startUrl: 'https://learn.example.edu', allowedHosts: ['*.example.edu'] }));
+  assert.throws(() => validateConfig({ startUrl: 'https://learn.example.edu', timeZone: 'invalid-zone' }));
+  const calendar = validateConfig({ startUrl: 'https://learn.example.edu', calendar: [
+    { start: '2026-09-07', end: '2026-09-21', firstWeek: 1, weekNames: { 2: 'Reading week' } },
+    { start: '2026-09-21', end: '2026-09-28', phase: 'Break' },
+    { start: '2026-09-28', end: '2026-10-12', firstWeek: 3 },
+  ] }).calendar;
+  assert.equal(academicWeek('2026-09-07', calendar).week, 1);
+  assert.equal(academicWeek('2026-09-14', calendar).phase, 'Reading week');
+  assert.equal(academicWeek('2026-09-21', calendar).week, undefined);
+  assert.equal(academicWeek('2026-09-21', calendar).phase, 'Break');
+  assert.equal(academicWeek('2026-09-28', calendar).week, 3);
+  assert.equal(academicWeek('2026-10-12', calendar).week, undefined);
+  assert.equal(academicWeek('2026-09-07', []).week, undefined);
+  assert.throws(() => validateConfig({ startUrl: START_URL, calendar: [{ start: '2026-02-30', end: '2026-03-10' }] }));
+  assert.throws(() => validateConfig({ startUrl: START_URL, calendar: [{ start: '2026-09-21', end: '2026-09-07' }] }));
+  assert.throws(() => validateConfig({ startUrl: START_URL, calendar: [calendar[0], calendar[0]] }));
+  assert.equal(localDate(new Date('2026-09-30T23:30:00Z'), 'Europe/London'), '2026-10-01');
+  assert.equal(localDate(new Date('2026-09-30T23:30:00Z'), 'America/New_York'), '2026-09-30');
+  assert.equal(localDate(new Date('2026-10-25T23:30:00Z'), 'Europe/London'), '2026-10-25');
+  assert.throws(() => academicWeek('2026-02-30'));
+  const browser = await chromium.launch({ channel: 'msedge', headless: true });
+  try {
+    const fixture = await browser.newPage();
+    const origin = new URL(START_URL).origin;
+    const fixtures = new Map([
+      [origin + '/ultra/course', '<a href="/ultra/course">Courses</a>'],
+      [origin + '/webapps/portal/execute/tabs', '<a href="/webapps/login/?action=logout">Sign out</a>'],
+      [origin + '/login', '<label>Password<input type="password"></label>'],
+      [origin + '/mfa', '<input type="password" hidden><label>Verification code<input autocomplete="one-time-code"></label>'],
+      [origin + '/public', '<a hidden href="/ultra/course">Courses</a><a style="visibility:hidden" href="/logout">Log Out</a><p>Public information</p>'],
+      ['https://sso.fixture.invalid/auth', '<label>Verification code<input autocomplete="one-time-code"></label>'],
+    ]);
+    await fixture.route('**/*', route => route.fulfill({ status: 200, contentType: 'text/html', body: fixtures.get(route.request().url()) || 'Fixture not found' }));
+    for (const [url, expected] of [
+      [origin + '/ultra/course', 'signed_in'],
+      [origin + '/webapps/portal/execute/tabs', 'signed_in'],
+      [origin + '/login', 'needs_user'],
+      [origin + '/mfa', 'needs_user'],
+      [origin + '/public', 'pending'],
+      ['https://sso.fixture.invalid/auth', 'needs_user'],
+      ['about:blank', 'pending'],
+    ]) {
+      await fixture.goto(url);
+      assert.equal((await loginState(fixture)).status, expected, url);
+    }
+  } finally { await browser.close(); }
+  console.log('self-test passed (configuration, host isolation, calendars, time zones, Ultra/classic login and external SSO fixtures)');
+}
 
 if (process.argv.includes('--self-test')) {
-  assert(allowedUrl(START_URL));
-  assert(allowedUrl('https://www.bristol.ac.uk/'));
-  assert(allowedUrl('https://app.bristol.ac.uk/'));
-  assert(!allowedUrl('http://www.ole.bris.ac.uk/'));
-  assert(!allowedUrl('https://ole.bris.ac.uk.evil.example/'));
-  assert.equal(academicWeek('2026-09-30').week, 2);
-  assert.equal(academicWeek('2026-10-26').phase, '巩固周');
-  assert.equal(academicWeek('2027-01-18').week, 13);
-  assert.equal(academicWeek('2027-03-22').phase, '春假');
-  assert.equal(academicWeek('2027-04-12').week, 22);
-  assert.equal(dateContext(new Date('2026-09-30T23:30:00Z')).tomorrow.date, '2026-10-02');
-  assert.equal(dateContext(new Date('2026-10-25T23:30:00Z')).tomorrow.week, 6);
-  assert.throws(() => academicWeek('2026-02-30'));
-  console.log('self-test passed');
+  selfTest().catch(error => { console.error(error); process.exitCode = 1; });
 } else {
   let shuttingDown = false;
   const shutdown = () => {

@@ -1,0 +1,5 @@
+{
+  "startUrl": "https://blackboard.example.edu/",
+  "allowedHosts": [],
+  "timeZone": "Europe/London"
+}
