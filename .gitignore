@@ -1,0 +1,9 @@
+materials/
+mcp/node_modules/
+node_modules/
+.env
+.env.*
+*.local.json
+profile/
+edge-profile/
+*.log

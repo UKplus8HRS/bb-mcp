@@ -1,0 +1,11 @@
+{
+  "name": "bristol-blackboard-playwright-mcp",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Playwright MCP for University of Bristol Blackboard",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "playwright": "1.63.0",
+    "zod": "3.25.76"
+  }
+}
