@@ -6,7 +6,17 @@ on:
 
 jobs:
   test:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            channel: msedge
+          - os: ubuntu-latest
+            channel: chromium
+    runs-on: ${{ matrix.os }}
+    env:
+      BB_BROWSER_CHANNEL: ${{ matrix.channel }}
     defaults:
       run:
         working-directory: mcp
@@ -18,4 +28,6 @@ jobs:
           cache: npm
           cache-dependency-path: mcp/package-lock.json
       - run: npm ci
+      - if: matrix.channel == 'chromium'
+        run: npx playwright install --with-deps chromium
       - run: npm test

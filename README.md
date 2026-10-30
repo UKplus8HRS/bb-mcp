@@ -48,9 +48,13 @@ flowchart LR
 
 ## 🚀 Quick start
 
-> **Requirements:** Windows with Microsoft Edge (macOS/Linux work with Chrome or Chromium via `browserChannel`, but are less tested), Node.js 20+, a Blackboard account, and an MCP client that supports local stdio servers.
+> **Requirements:** Node.js 20+, a Blackboard account, an MCP client that supports local stdio servers, and a browser: Microsoft Edge on Windows, Google Chrome on macOS and Linux by default (see `browserChannel`). The browser window needs a desktop session; on a headless Linux machine, run the server with `xvfb-run`.
 
 **1. Install**
+
+<table>
+<tr><th>Windows (PowerShell)</th><th>macOS / Linux</th></tr>
+<tr><td>
 
 ```powershell
 git clone https://github.com/UKplus8HRS/bb-mcp.git
@@ -59,6 +63,21 @@ Copy-Item config.example.json config.local.json
 cd mcp
 npm.cmd ci
 ```
+
+</td><td>
+
+```bash
+git clone https://github.com/UKplus8HRS/bb-mcp.git
+cd bb-mcp
+cp config.example.json config.local.json
+cd mcp
+npm ci
+```
+
+</td></tr>
+</table>
+
+No Chrome on Linux? Set `"browserChannel": "chromium"` and run `npx playwright install chromium` in the `mcp` folder.
 
 **2. Point it at your Blackboard.** Edit `config.local.json` in the repository root:
 
@@ -75,7 +94,7 @@ npm.cmd ci
 ```toml
 [mcp_servers.blackboard_playwright]
 command = "node"
-args = ['C:\path\to\bb-mcp\mcp\server.js']
+args = ['C:\path\to\bb-mcp\mcp\server.js']   # macOS/Linux: ['/home/you/bb-mcp/mcp/server.js']
 startup_timeout_sec = 60
 tool_timeout_sec = 90
 ```
@@ -148,7 +167,7 @@ All settings live in `config.local.json` in the repository root. Set the `BB_CON
 | --- | :---: | --- | --- |
 | `startUrl` | ✅ | — | Your Blackboard entry URL (HTTPS, no embedded credentials). Its hostname and subdomains are allowed automatically. |
 | `allowedHosts` |  | `[]` | Extra trusted hosts for `blackboard_open` and URL downloads, such as a student portal. Bare hostnames only: no schemes, ports, paths or wildcards. |
-| `browserChannel` |  | `msedge` | `msedge`, `chrome`, or `chromium`. |
+| `browserChannel` |  | Windows: `msedge`<br/>others: `chrome` | `msedge`, `chrome`, or `chromium` (Playwright's bundled build). |
 | `timeZone` |  | system | IANA time zone, such as `Europe/London` or `Asia/Shanghai`. |
 | `profileDir` |  | `~/.blackboard-mcp/<host>/edge-profile` | Browser profile location. Relative paths resolve from the config file's directory. |
 | `loginButtonName` |  | common SSO labels | Exact visible text of your institution's login link or button. |
@@ -248,6 +267,24 @@ Another MCP server process, or a manually opened browser window, is already usin
 </details>
 
 <details>
+<summary><b>The browser is not installed</b></summary>
+
+<br/>
+
+Install the browser named in the error, or switch `browserChannel`. For `chromium`, run `npx playwright install chromium` in the `mcp` folder (on Linux add `--with-deps` to install system libraries).
+
+</details>
+
+<details>
+<summary><b>No graphical display is available (Linux)</b></summary>
+
+<br/>
+
+The browser window needs an X11 or Wayland session. On a server or in a container, start the MCP server under a virtual display, for example `xvfb-run -a node /path/to/bb-mcp/mcp/server.js`. You will not see the window, so sign in from a desktop machine first, or use a forwarded display for the initial login.
+
+</details>
+
+<details>
 <summary><b>Sign-in is never confirmed</b></summary>
 
 <br/>
@@ -283,7 +320,7 @@ npm.cmd test
 
 The tests cover configuration validation, host restrictions, calendars and time zones, Ultra/classic and SSO login detection, tab recovery, frames, refused secret fields, URL downloads and archiving, and REST API paging. They use a temporary headless browser profile, intercepted pages and a local fixture server, and never sign in to a real school account.
 
-Set `BB_BROWSER_CHANNEL=chromium` (or `chrome`) to run them without Edge. GitHub Actions runs them on Windows with Edge.
+Set `BB_BROWSER_CHANNEL=chromium` (or `chrome`) to run them without Edge. GitHub Actions runs them on Windows with Edge and on Ubuntu with Chromium.
 
 ## 📄 License
 

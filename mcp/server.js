@@ -26,7 +26,7 @@ const configSchema = z.object({
   startUrl: z.string().url(),
   allowedHosts: z.array(z.string().regex(/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i)).default([]),
   timeZone: z.string().default(Intl.DateTimeFormat().resolvedOptions().timeZone),
-  browserChannel: z.enum(['msedge', 'chrome', 'chromium']).default('msedge'),
+  browserChannel: z.enum(['msedge', 'chrome', 'chromium']).optional(),
   profileDir: z.string().min(1).optional(),
   loginButtonName: z.string().min(1).optional(),
   signedInSelector: z.string().min(1).optional(),
@@ -59,7 +59,7 @@ const CONFIG = validateConfig(configInput);
 const START_URL = CONFIG.startUrl;
 const ORIGIN = new URL(START_URL).origin;
 // BB_BROWSER_CHANNEL lets the self-test run where the configured browser is not installed.
-const CHANNEL = process.env.BB_BROWSER_CHANNEL || CONFIG.browserChannel;
+const CHANNEL = process.env.BB_BROWSER_CHANNEL || CONFIG.browserChannel || (process.platform === 'win32' ? 'msedge' : 'chrome');
 let PROFILE = CONFIG.profileDir ? path.resolve(path.dirname(configPath), CONFIG.profileDir) : path.join(os.homedir(), '.blackboard-mcp', new URL(START_URL).hostname, 'edge-profile');
 const DOWNLOAD_DIR = path.join(os.tmpdir(), 'codex-blackboard-downloads');
 const ARCHIVE_MODULE = pathToFileURL(path.join(__dirname, '..', 'scripts', 'archive-blackboard-file.mjs')).href;
@@ -172,6 +172,19 @@ async function edgeUsingProfile() {
   return stdout.trim().length > 0;
 }
 
+// Turns common launch failures into actionable messages.
+function launchError(error, { platform = process.platform, env = process.env, headless = SELF_TEST } = {}) {
+  const message = error?.message || String(error);
+  if (/ProcessSingleton|profile (?:directory )?is already in use/i.test(message)) return new Error(BUSY_MESSAGE);
+  if (/distribution '[^']*' is not found|Executable doesn't exist/i.test(message)) {
+    return new Error(`The ${CHANNEL} browser is not installed. Install it, or set browserChannel in your configuration (for chromium, run "npx playwright install chromium" in the mcp folder).`);
+  }
+  if (/XServer|Missing X server|\$DISPLAY/i.test(message) || (!headless && platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY)) {
+    return new Error('No graphical display is available for the browser window. Run the MCP server from a desktop session, or start it with xvfb-run on a headless machine.');
+  }
+  return error;
+}
+
 function livePage() {
   return context?.pages().filter(p => !p.isClosed()).at(-1);
 }
@@ -209,7 +222,7 @@ async function ensureBrowser() {
     } catch (error) {
       if (context) await context.close().catch(() => {});
       await unlock();
-      throw error;
+      throw launchError(error);
     }
   })().finally(() => { launching = undefined; });
   return launching;
@@ -569,6 +582,14 @@ async function selfTest() {
   assert.throws(() => validateConfig({ startUrl: 'https://learn.example.edu', allowedHosts: ['*.example.edu'] }));
   assert.throws(() => validateConfig({ startUrl: 'https://learn.example.edu', timeZone: 'invalid-zone' }));
   assert.throws(() => validateConfig({ startUrl: 'https://learn.example.edu', browserChannel: 'firefox' }));
+  const desktop = { platform: 'linux', env: { DISPLAY: ':0' } };
+  assert.equal(launchError(new Error('Failed to create a ProcessSingleton for your profile directory.'), desktop).message, BUSY_MESSAGE);
+  assert.match(launchError(new Error('Looks like you launched a headed browser without having a XServer running.'), desktop).message, /xvfb-run/);
+  assert.match(launchError(new Error('Target page, context or browser has been closed'), { platform: 'linux', env: {}, headless: false }).message, /No graphical display/);
+  assert.equal(launchError(new Error('Target page, context or browser has been closed'), { platform: 'linux', env: {}, headless: true }).message, 'Target page, context or browser has been closed');
+  assert.match(launchError(new Error("Chromium distribution 'chrome' is not found at /opt/google/chrome/chrome"), { platform: 'linux', env: {}, headless: false }).message, /not installed/);
+  assert.match(launchError(new Error("Chromium distribution 'chrome' is not found at /opt/google/chrome/chrome"), desktop).message, /not installed/);
+  assert.equal(launchError(new Error('other'), { platform: 'win32', env: {} }).message, 'other');
   const calendar = validateConfig({ startUrl: 'https://learn.example.edu', calendar: [
     { start: '2026-09-07', end: '2026-09-21', firstWeek: 1, weekNames: { 2: 'Reading week' } },
     { start: '2026-09-21', end: '2026-09-28', phase: 'Break' },
@@ -644,6 +665,11 @@ async function selfTest() {
   const local = `http://127.0.0.1:${files.address().port}`;
   const course = `self-test-${randomUUID()}`;
   try {
+    if (process.platform !== 'win32') {
+      await fs.writeFile(path.join(PROFILE, '.bb-mcp.lock'), '2147483646');
+      const unlockStale = await acquireFileLock();
+      await unlockStale();
+    }
     const first = await ensureBrowser();
     await assert.rejects(acquireLock(), /BUSY/);
     const popup = await context.newPage();
