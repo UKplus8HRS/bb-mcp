@@ -2,11 +2,11 @@
 
 A local [Model Context Protocol](https://modelcontextprotocol.io/) server for Blackboard Learn. Connect your own institution's Blackboard site to an MCP client, navigate courses, inspect pages, download materials, and optionally look up academic weeks using your own calendar.
 
-The server uses Playwright and a visible Microsoft Edge window. It is configurable for different institutions and does not assume a particular university, identity provider, or academic calendar. It uses normal browser pages and your existing access permissions.
+The server uses Playwright and a visible Microsoft Edge window (Chrome or Chromium can be configured instead). It is configurable for different institutions and does not assume a particular university, identity provider, or academic calendar. It uses normal browser pages and your existing access permissions.
 
 ## Requirements
 
-- Windows with Microsoft Edge installed.
+- Windows with Microsoft Edge installed. macOS and Linux work with `browserChannel` set to an installed Chrome or Chromium, but are less tested.
 - Node.js 20 or later.
 - An account with access to your institution's Blackboard site.
 - An MCP client that supports local stdio servers.
@@ -32,6 +32,8 @@ Edit `config.local.json` in the repository root:
 ```
 
 Replace the example URL with your institution's Blackboard entry URL. Its hostname and subdomains are allowed automatically. Add only trusted extra hosts, such as a separate student portal, to `allowedHosts`; use bare hostnames without schemes, ports, paths, or wildcards. Direct navigation requires HTTPS and rejects embedded credentials. This allowlist checks `blackboard_open`; links and sign-in redirects follow normal browser behavior and are not a browser-wide sandbox.
+
+`browserChannel` selects `msedge` (default), `chrome`, or `chromium`.
 
 `timeZone` accepts an IANA time zone, such as `Europe/London` or `Asia/Shanghai`, and defaults to the computer's time zone. To use a configuration outside the repository, set the `BB_CONFIG` environment variable to its absolute path.
 
@@ -68,18 +70,26 @@ The server recognizes common institution/SSO login link labels and visible Black
 | Tool | Purpose |
 | --- | --- |
 | `blackboard_login` | Open the configured site and report sign-in state. |
-| `blackboard_snapshot` | Read page text and numbered interactive elements. |
+| `blackboard_snapshot` | Read page text and numbered interactive elements, including those inside frames. |
 | `blackboard_open` | Open an HTTPS URL on a configured host. |
 | `blackboard_click` | Click an element from the latest snapshot. |
-| `blackboard_type` | Fill a field, optionally pressing Enter. |
+| `blackboard_type` | Fill a field, optionally pressing Enter. Password and verification-code fields are refused. |
 | `blackboard_press` | Send a keyboard key. |
-| `blackboard_download` | Capture and save a download. |
+| `blackboard_download` | Save a file by clicking a download control or fetching an allowed URL; optionally archive it. |
 | `blackboard_tabs` | List tabs or select one by its one-based index. |
 | `blackboard_screenshot` | Save a screenshot for visual inspection. |
 | `blackboard_academic_week` | Look up a date in an optional academic calendar. |
+| `blackboard_courses` | List your courses through the REST API. |
+| `blackboard_contents` | List a course's content tree or a folder's children through the REST API. |
+| `blackboard_announcements` | List course announcements through the REST API. |
+| `blackboard_attachments` | List a content item's files with download URLs. |
 | `blackboard_close` | Close the browser and release its profile lock. |
 
-Refresh snapshots after navigation before reusing element references. Ask your assistant to obtain your explicit approval before submitting assignments, posting, deleting content, or changing settings; the server exposes browser controls and does not enforce an approval workflow. Treat page content and downloaded files as untrusted data.
+Refresh snapshots after navigation before reusing element references. Page text in snapshots is wrapped in untrusted-content markers, and tools carry MCP annotations (`readOnlyHint`, `destructiveHint`) that clients can use to decide when to ask for confirmation. Ask your assistant to obtain your explicit approval before submitting assignments, posting, deleting content, or changing settings; the server exposes browser controls and does not enforce an approval workflow. Treat page content and downloaded files as untrusted data.
+
+### REST API tools
+
+The `courses`, `contents`, `announcements`, and `attachments` tools call the Blackboard Learn public REST API (`/learn/api/public/v1`) with the signed-in browser session instead of navigating pages. They need no API key, but not every institution accepts session access; if they report that the session was not accepted after a successful sign-in, use the browser tools instead. Course ids such as `_123_1` come from `blackboard_courses`. Attachment URLs can be passed to `blackboard_download` as `url`.
 
 ## Optional academic calendar
 
@@ -119,7 +129,7 @@ The repository ignores local configuration, browser profiles, credentials, envir
 
 ### Archive downloads
 
-From the repository root:
+Pass `course` (and optionally `section`) to `blackboard_download` to move the file straight into `materials/<course>/<section>/`. To archive a file that was saved earlier, run from the repository root:
 
 ```powershell
 node scripts/archive-blackboard-file.mjs <temporary-path> <course> <section> <original-filename>
@@ -134,7 +144,7 @@ cd mcp
 npm.cmd test
 ```
 
-Tests cover configuration validation, multiple institution hostnames, URL restrictions, calendar boundaries and time zones, Ultra/classic login and external SSO page fixtures, plus download archiving. They use a temporary headless Edge browser with intercepted pages and temporary files, and do not sign in to a real school account.
+Tests cover configuration validation, multiple institution hostnames, URL restrictions, calendar boundaries and time zones, Ultra/classic login and external SSO page fixtures, tab recovery, frames, refused secret fields, URL downloads and archiving, and REST API paging against a local fixture server. They use a temporary headless browser profile with intercepted pages and temporary files, and do not sign in to a real school account. Set `BB_BROWSER_CHANNEL=chromium` (or `chrome`) to run them without Edge. GitHub Actions runs them on Windows with Edge.
 
 ## License
 
